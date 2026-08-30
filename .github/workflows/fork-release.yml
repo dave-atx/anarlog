@@ -1,0 +1,208 @@
+name: fork-release
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  rebase-and-build:
+    runs-on: macos-26
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          lfs: true
+
+      - name: Set up upstream remote
+        run: |
+          git remote add upstream https://github.com/fastrepl/anarlog.git 2>/dev/null || true
+          git fetch upstream --tags --force
+          git config user.name "fork-bot"
+          git config user.email "fork-bot@users.noreply.github.com"
+
+      - name: Resolve latest upstream tag
+        id: tag
+        run: |
+          TAG=$(git tag --list 'desktop_v*' --sort=-v:refname | head -1)
+          if [[ -z "$TAG" ]]; then
+            echo "::error::No desktop_v* tag found"
+            exit 1
+          fi
+          VERSION=${TAG#desktop_v}
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved $TAG -> $VERSION"
+
+      - name: Skip if release already exists
+        id: check-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="fork_v${{ steps.tag.outputs.version }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase fork onto upstream tag
+        if: steps.check-release.outputs.skip == 'false'
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          # fork branch may not exist on first run; handle that
+          if git rev-parse --verify fork >/dev/null 2>&1; then
+            OLD_BASE=$(git merge-base fork upstream/main 2>/dev/null || git merge-base HEAD upstream/main)
+            echo "Rebasing fork onto $TAG (old base $OLD_BASE)"
+            if ! git rebase --onto "$TAG" "$OLD_BASE" fork; then
+              git rebase --abort || true
+              echo "::error::Rebase conflict onto $TAG — resolve locally"
+              # Open an issue for visibility
+              gh issue create --title "fork rebase conflict onto $TAG" --body "Automated rebase failed. Resolve locally: git fetch upstream --tags && git rebase --onto $TAG \$(git merge-base fork upstream/main) fork" || true
+              exit 1
+            fi
+            git checkout fork
+          else
+            git checkout -b fork "$TAG"
+          fi
+          git push --force-with-lease origin fork || git push --force origin fork
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout fork branch
+        if: steps.check-release.outputs.skip == 'false'
+        run: git checkout fork
+
+      - name: Set app version
+        if: steps.check-release.outputs.skip == 'false'
+        run: ./scripts/version.sh "./apps/desktop/src-tauri/tauri.conf.json" "${{ steps.tag.outputs.version }}"
+
+      - uses: ./.github/actions/install_desktop_deps
+        if: steps.check-release.outputs.skip == 'false'
+        with:
+          target: macos
+
+      - uses: ./.github/actions/rust_install
+        if: steps.check-release.outputs.skip == 'false'
+        with:
+          platform: macos
+
+      - run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> $GITHUB_ENV
+        if: steps.check-release.outputs.skip == 'false'
+
+      - uses: ./.github/actions/pnpm_install
+        if: steps.check-release.outputs.skip == 'false'
+
+      - run: pnpm -F ui build
+        if: steps.check-release.outputs.skip == 'false'
+
+      - name: Prepare binaries and sidecars
+        if: steps.check-release.outputs.skip == 'false'
+        run: |
+          TAURI_ENV_TARGET_TRIPLE=aarch64-apple-darwin cargo xtask prepare-binaries
+          ./scripts/sidecar.sh "./apps/desktop/src-tauri/tauri.conf.stable.json" "binaries/char-chrome-native-host"
+          ./scripts/sidecar.sh "./apps/desktop/src-tauri/tauri.conf.stable.json" "binaries/check-permissions"
+          ./scripts/sidecar.sh "./apps/desktop/src-tauri/tauri.conf.stable.json" "resources/cli/anarlog-cli"
+
+      - uses: ./.github/actions/apple_cert
+        if: steps.check-release.outputs.skip == 'false'
+        id: apple-cert
+        with:
+          apple-certificate: ${{ secrets.APPLE_CERTIFICATE }}
+          apple-certificate-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
+
+      - name: Codesign cloudsync dylib
+        if: steps.check-release.outputs.skip == 'false'
+        working-directory: ./apps/desktop
+        run: |
+          CLOUDSYNC_DYLIB="../../crates/cloudsync/vendor/cloudsync/macos/aarch64/cloudsync.dylib"
+          codesign --force --sign "${{ steps.apple-cert.outputs.cert-id }}" --timestamp --options runtime "$CLOUDSYNC_DYLIB"
+          codesign --verify --strict --verbose=2 "$CLOUDSYNC_DYLIB"
+
+      - name: Build desktop (aarch64)
+        if: steps.check-release.outputs.skip == 'false'
+        env:
+          CI: false
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          VITE_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN_HYPRNOTE_2 }}
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+          APP_VERSION: ${{ steps.tag.outputs.version }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ steps.apple-cert.outputs.cert-id }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+          VITE_APP_VERSION: ${{ steps.tag.outputs.version }}
+        run: pnpm -F desktop tauri build --target aarch64-apple-darwin --config ./src-tauri/tauri.conf.stable.json --config ./src-tauri/tauri.conf.fork.json --verbose
+
+      - name: Locate artifacts
+        if: steps.check-release.outputs.skip == 'false'
+        id: artifacts
+        run: |
+          set -euo pipefail
+          DMG=$(find "apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg" -name "*.dmg" -type f | head -1)
+          TARBALL=$(find "apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos" -name "*.app.tar.gz" -type f | head -1)
+          SIG="${TARBALL}.sig"
+          if [[ -z "$DMG" || -z "$TARBALL" || ! -f "$SIG" ]]; then
+            echo "::error::Missing DMG/tarball/sig: DMG=$DMG TARBALL=$TARBALL SIG=$SIG"
+            exit 1
+          fi
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "sig=$SIG" >> "$GITHUB_OUTPUT"
+          echo "Found DMG=$DMG TARBALL=$TARBALL"
+
+      - uses: ./.github/actions/macos_notarize_dmg
+        if: steps.check-release.outputs.skip == 'false'
+        with:
+          dmg-path: ${{ steps.artifacts.outputs.dmg }}
+          signing-identity: ${{ steps.apple-cert.outputs.cert-id }}
+          apple-id: ${{ secrets.APPLE_ID }}
+          apple-password: ${{ secrets.APPLE_PASSWORD }}
+          apple-team-id: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Generate latest.json
+        if: steps.check-release.outputs.skip == 'false'
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          TARBALL="${{ steps.artifacts.outputs.tarball }}"
+          SIG="${{ steps.artifacts.outputs.sig }}"
+          TAG="fork_v${VERSION}"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/$(basename "$TARBALL")"
+          node fork/latest-json.mjs --version "$VERSION" --sig-file "$SIG" --url "$URL" > latest.json
+          cat latest.json
+
+      - name: Create GitHub Release
+        if: steps.check-release.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          TAG="fork_v${VERSION}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "fork_v${VERSION}" \
+            --notes "Fork build of upstream desktop_v${VERSION} (arm64, auto-update via fork endpoint)." \
+            "${{ steps.artifacts.outputs.dmg }}" \
+            "${{ steps.artifacts.outputs.tarball }}" \
+            "${{ steps.artifacts.outputs.sig }}" \
+            latest.json
