@@ -1,3 +1,18 @@
+# Fork-only automation: nightly force-rebases the `fork` branch onto the latest
+# upstream desktop_v* tag and builds/publishes a release. Don't treat `fork` as a
+# stable integration branch. This file has no upstream counterpart, so it's a safe
+# place to record fork-maintenance notes without risking rebase conflicts.
+#
+# Maintenance notes:
+# - The push step needs `secrets.FORK_PUSH_TOKEN` (fine-grained PAT, Contents RW +
+#   Workflows RW, no expiration) because GitHub blocks the default GITHUB_TOKEN
+#   from pushing any diff that touches .github/workflows/* ("refusing to allow a
+#   GitHub App to create or update workflow ... without `workflows` permission").
+#   This trips whenever upstream edits any of its own workflow files, which the
+#   nightly rebase then carries onto `fork`.
+# - Issues are disabled on this repo, so the `gh issue create` conflict alert
+#   below silently no-ops on failure. A real rebase conflict won't page anyone —
+#   check the Actions run history for fork-release directly.
 name: fork-release
 on:
   schedule:
@@ -24,6 +39,7 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           lfs: true
+          token: ${{ secrets.FORK_PUSH_TOKEN }}
 
       - name: Set up upstream remote
         run: |
