@@ -83,7 +83,7 @@ jobs:
       - name: Resolve latest upstream tag
         id: tag
         run: |
-          TAG=$(git tag --list 'desktop_v*' --sort=-v:refname | head -1)
+          TAG=$(git for-each-ref --format='%(refname:strip=2)' --sort=-v:refname --count=1 'refs/tags/desktop_v*')
           if [[ -z "$TAG" ]]; then
             echo "::error::No desktop_v* tag found"
             exit 1
@@ -262,8 +262,8 @@ jobs:
         id: artifacts
         run: |
           set -euo pipefail
-          DMG=$(find "apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg" -name "*.dmg" -type f | head -1)
-          TARBALL=$(find "apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos" -name "*.app.tar.gz" -type f | head -1)
+          DMG=$(find "apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg" -name "*.dmg" -type f -print -quit)
+          TARBALL=$(find "apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos" -name "*.app.tar.gz" -type f -print -quit)
           SIG="${TARBALL}.sig"
           if [[ -z "$DMG" || -z "$TARBALL" || ! -f "$SIG" ]]; then
             echo "::error::Missing DMG/tarball/sig: DMG=$DMG TARBALL=$TARBALL SIG=$SIG"
@@ -436,7 +436,7 @@ jobs:
           find artifacts -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' -o -name 'anarlog-cli-*.tar.gz' \) \
             -exec cp {} dist/ \;
           ls -l dist/
-          TARBALL=$(find dist -name '*.app.tar.gz' | head -1)
+          TARBALL=$(find dist -name '*.app.tar.gz' -print -quit)
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
           echo "sig=${TARBALL}.sig" >> "$GITHUB_OUTPUT"
 
