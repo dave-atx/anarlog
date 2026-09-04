@@ -3,6 +3,10 @@
 # stable integration branch. This file has no upstream counterpart, so it's a safe
 # place to record fork-maintenance notes without risking rebase conflicts.
 #
+# Job graph:
+#   prepare -> desktop (macOS arm64 app)  -\
+#           -> cli     (4 CLI binaries)   --> publish (release + Homebrew tap bump)
+#
 # Maintenance notes:
 # - The push step needs `secrets.FORK_PUSH_TOKEN` (fine-grained PAT, Contents RW +
 #   Workflows RW, no expiration) because GitHub blocks the default GITHUB_TOKEN
@@ -10,29 +14,57 @@
 #   GitHub App to create or update workflow ... without `workflows` permission").
 #   This trips whenever upstream edits any of its own workflow files, which the
 #   nightly rebase then carries onto `fork`.
+# - The tap bump needs `secrets.TAP_PUSH_TOKEN` (fine-grained PAT, Contents RW on
+#   dave-atx/homebrew-anarlog). A PAT scoped only to this repo cannot push there.
 # - Issues are disabled on this repo, so the `gh issue create` conflict alert
-#   below silently no-ops on failure. A real rebase conflict won't page anyone —
+#   below silently no-ops on failure. A real rebase conflict won't page anyone --
 #   check the Actions run history for fork-release directly.
+# - Linux CLI binaries build on ubuntu-22.04 (glibc 2.35), NOT 24.04. Building on
+#   24.04 pins the binary's symbol floor to GLIBC_2.39 (GCC 13+ emits __isoc23_*),
+#   which refuses to run on Ubuntu 22.04 / Debian 12 / RHEL 9. Do not "modernize"
+#   these runner labels.
+# - The CLI matrix is skipped entirely when nothing in its dependency tree changed
+#   since the last CLI-bearing release. Each binary is ~24 MiB and upstream ships
+#   near-daily, so rebuilding unchanged bytes every night is pure waste. Force a
+#   rebuild with the `force_cli` dispatch input.
 name: fork-release
 on:
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
+    inputs:
+      force_cli:
+        description: "Build and publish CLI assets even if unchanged"
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
-  issues: write
+  contents: read
 
 concurrency:
   group: fork-release
   cancel-in-progress: false
 
+env:
+  TAP_REPO: dave-atx/homebrew-anarlog
+  TAP_FORMULA: Formula/anarlog-cli.rb
+
 jobs:
-  rebase-and-build:
-    runs-on: macos-26
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      issues: write
     defaults:
       run:
         shell: bash
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      skip: ${{ steps.check-release.outputs.skip }}
+      sha: ${{ steps.rebase.outputs.sha }}
+      cli-changed: ${{ steps.cli-fingerprint.outputs.changed }}
+      cli-fingerprint: ${{ steps.cli-fingerprint.outputs.fingerprint }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,28 +96,31 @@ jobs:
       - name: Skip if release already exists
         id: check-release
         env:
+          VERSION: ${{ steps.tag.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="fork_v${{ steps.tag.outputs.version }}"
+          TAG="fork_v${VERSION}"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Release $TAG already exists — skipping"
+            echo "Release $TAG already exists -- skipping"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Rebase fork onto upstream tag
+        id: rebase
         if: steps.check-release.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
           # fork branch may not exist on first run; handle that
           if git rev-parse --verify fork >/dev/null 2>&1; then
             OLD_BASE=$(git merge-base fork upstream/main 2>/dev/null || git merge-base HEAD upstream/main)
             echo "Rebasing fork onto $TAG (old base $OLD_BASE)"
             if ! git rebase --onto "$TAG" "$OLD_BASE" fork; then
               git rebase --abort || true
-              echo "::error::Rebase conflict onto $TAG — resolve locally"
-              # Open an issue for visibility
+              echo "::error::Rebase conflict onto $TAG -- resolve locally"
               gh issue create --title "fork rebase conflict onto $TAG" --body "Automated rebase failed. Resolve locally: git fetch upstream --tags && git rebase --onto $TAG \$(git merge-base fork upstream/main) fork" || true
               exit 1
             fi
@@ -94,38 +129,92 @@ jobs:
             git checkout -b fork "$TAG"
           fi
           git push --force-with-lease origin fork || git push --force origin fork
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout fork branch
+      # Fingerprint the CLI's build inputs. The path list mirrors the build-relevant
+      # half of cli_ci.yaml's trigger paths -- keep the two in sync when upstream
+      # edits that workflow. git ls-tree emits the tree/blob object ids for these
+      # paths, so the hash changes if and only if their content changes.
+      - name: Fingerprint CLI build inputs
+        id: cli-fingerprint
         if: steps.check-release.outputs.skip == 'false'
-        run: git checkout fork
+        env:
+          HEAD_SHA: ${{ steps.rebase.outputs.sha }}
+          FORCE_CLI: ${{ inputs.force_cli }}
+        run: |
+          FINGERPRINT=$(git ls-tree "${HEAD_SHA}" \
+            apps/cli \
+            crates/agent-access \
+            crates/cli-docs \
+            crates/cloudsync \
+            crates/db-app \
+            crates/db-change \
+            crates/db-core \
+            crates/db-migrate \
+            crates/tiptap \
+            Cargo.lock \
+            Cargo.toml \
+            rust-toolchain.toml \
+            | sha256sum | cut -d' ' -f1)
+          echo "fingerprint=$FINGERPRINT" >> "$GITHUB_OUTPUT"
+
+          # The previously published fingerprint lives as a comment in the tap
+          # formula. Absent tap / absent line / first run all mean "build it".
+          PREVIOUS=$(curl -fsSL \
+            "https://raw.githubusercontent.com/${TAP_REPO}/main/${TAP_FORMULA}" 2>/dev/null \
+            | sed -n 's/^[[:space:]]*# cli-fingerprint: //p' | head -1 || true)
+
+          if [[ "${FORCE_CLI}" == "true" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "force_cli requested -- building CLI"
+          elif [[ -z "$PREVIOUS" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No previous fingerprint in tap -- building CLI"
+          elif [[ "$PREVIOUS" == "$FINGERPRINT" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "CLI unchanged ($FINGERPRINT) -- skipping build"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "CLI changed: $PREVIOUS -> $FINGERPRINT"
+          fi
+
+  desktop:
+    needs: prepare
+    if: needs.prepare.outputs.skip == 'false'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          lfs: true
+          persist-credentials: false
 
       - name: Set app version
-        if: steps.check-release.outputs.skip == 'false'
-        run: ./scripts/version.sh "./apps/desktop/src-tauri/tauri.conf.json" "${{ steps.tag.outputs.version }}"
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: ./scripts/version.sh "./apps/desktop/src-tauri/tauri.conf.json" "$VERSION"
 
       - uses: ./.github/actions/install_desktop_deps
-        if: steps.check-release.outputs.skip == 'false'
         with:
           target: macos
 
       - uses: ./.github/actions/rust_install
-        if: steps.check-release.outputs.skip == 'false'
         with:
           platform: macos
 
       - run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> $GITHUB_ENV
-        if: steps.check-release.outputs.skip == 'false'
 
       - uses: ./.github/actions/pnpm_install
-        if: steps.check-release.outputs.skip == 'false'
 
       - run: pnpm -F ui build
-        if: steps.check-release.outputs.skip == 'false'
 
       - name: Prepare binaries and sidecars
-        if: steps.check-release.outputs.skip == 'false'
         run: |
           TAURI_ENV_TARGET_TRIPLE=aarch64-apple-darwin cargo xtask prepare-binaries
           ./scripts/sidecar.sh "./apps/desktop/src-tauri/tauri.conf.stable.json" "binaries/char-chrome-native-host"
@@ -133,7 +222,6 @@ jobs:
           ./scripts/sidecar.sh "./apps/desktop/src-tauri/tauri.conf.stable.json" "resources/cli/anarlog-cli"
 
       - uses: ./.github/actions/apple_cert
-        if: steps.check-release.outputs.skip == 'false'
         id: apple-cert
         with:
           apple-certificate: ${{ secrets.APPLE_CERTIFICATE }}
@@ -141,15 +229,15 @@ jobs:
           keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
 
       - name: Codesign cloudsync dylib
-        if: steps.check-release.outputs.skip == 'false'
         working-directory: ./apps/desktop
+        env:
+          CERT_ID: ${{ steps.apple-cert.outputs.cert-id }}
         run: |
           CLOUDSYNC_DYLIB="../../crates/cloudsync/vendor/cloudsync/macos/aarch64/cloudsync.dylib"
-          codesign --force --sign "${{ steps.apple-cert.outputs.cert-id }}" --timestamp --options runtime "$CLOUDSYNC_DYLIB"
+          codesign --force --sign "${CERT_ID}" --timestamp --options runtime "$CLOUDSYNC_DYLIB"
           codesign --verify --strict --verbose=2 "$CLOUDSYNC_DYLIB"
 
       - name: Build desktop (aarch64)
-        if: steps.check-release.outputs.skip == 'false'
         env:
           CI: false
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -157,7 +245,7 @@ jobs:
           VITE_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN_HYPRNOTE_2 }}
           CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
-          APP_VERSION: ${{ steps.tag.outputs.version }}
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -167,11 +255,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           VITE_API_URL: ${{ vars.VITE_API_URL }}
-          VITE_APP_VERSION: ${{ steps.tag.outputs.version }}
+          VITE_APP_VERSION: ${{ needs.prepare.outputs.version }}
         run: pnpm -F desktop tauri build --target aarch64-apple-darwin --config ./src-tauri/tauri.conf.stable.json --config ./src-tauri/tauri.conf.fork.json --verbose
 
       - name: Locate artifacts
-        if: steps.check-release.outputs.skip == 'false'
         id: artifacts
         run: |
           set -euo pipefail
@@ -188,7 +275,6 @@ jobs:
           echo "Found DMG=$DMG TARBALL=$TARBALL"
 
       - uses: ./.github/actions/macos_notarize_dmg
-        if: steps.check-release.outputs.skip == 'false'
         with:
           dmg-path: ${{ steps.artifacts.outputs.dmg }}
           signing-identity: ${{ steps.apple-cert.outputs.cert-id }}
@@ -196,29 +282,290 @@ jobs:
           apple-password: ${{ secrets.APPLE_PASSWORD }}
           apple-team-id: ${{ secrets.APPLE_TEAM_ID }}
 
-      - name: Generate latest.json
-        if: steps.check-release.outputs.skip == 'false'
+      - name: Stage desktop artifacts
+        env:
+          DMG_PATH: ${{ steps.artifacts.outputs.dmg }}
+          TARBALL_PATH: ${{ steps.artifacts.outputs.tarball }}
+          SIG_PATH: ${{ steps.artifacts.outputs.sig }}
         run: |
-          VERSION="${{ steps.tag.outputs.version }}"
-          TARBALL="${{ steps.artifacts.outputs.tarball }}"
-          SIG="${{ steps.artifacts.outputs.sig }}"
+          mkdir -p dist
+          cp "${DMG_PATH}" dist/
+          cp "${TARBALL_PATH}" dist/
+          cp "${SIG_PATH}" dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  cli:
+    needs: prepare
+    if: needs.prepare.outputs.skip == 'false' && needs.prepare.outputs.cli-changed == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # glibc 2.35 floor -- see the note at the top of this file before bumping
+          - runner: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+            native: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            targets: aarch64-unknown-linux-gnu
+            native: aarch64-unknown-linux-gnu
+          # rust_install platform=macos installs both Apple targets, so the arm64
+          # runner cross-builds the Intel binary too. No Intel runner needed.
+          - runner: macos-26
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+            native: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/rust_install
+        with:
+          platform: ${{ startsWith(matrix.runner, 'macos') && 'macos' || '' }}
+
+      - name: Build
+        env:
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          set -euo pipefail
+          for target in ${TARGETS}; do
+            echo "::group::build $target"
+            cargo build --locked --release -p anarlog-cli --target "$target"
+            echo "::endgroup::"
+          done
+
+      # Mirrors the smoke tests in cli_ci.yaml. Only the native binary can run on
+      # this runner; the cross-built one is verified structurally.
+      - name: Smoke test
+        env:
+          NATIVE: ${{ matrix.native }}
+        run: |
+          set -euo pipefail
+          BIN="target/${NATIVE}/release/anarlog"
+          "$BIN" --help
+          "$BIN" --version
+          "$BIN" meetings --help
+          "$BIN" mcp --help
+          if doctor_output="$("$BIN" --json --db-path "$RUNNER_TEMP/missing.db" doctor)"; then
+            echo "doctor unexpectedly reported a missing database as ready"
+            exit 1
+          fi
+          grep -q '"ready": false' <<<"$doctor_output"
+          if invalid_output="$("$BIN" --json meetings list --limit 0 2>&1)"; then
+            echo "invalid arguments unexpectedly succeeded"
+            exit 1
+          fi
+          grep -q '"code": "invalid_arguments"' <<<"$invalid_output"
+
+      - name: Verify glibc floor
+        if: startsWith(matrix.runner, 'ubuntu')
+        env:
+          NATIVE: ${{ matrix.native }}
+        run: |
+          set -euo pipefail
+          BIN="target/${NATIVE}/release/anarlog"
+          FLOOR=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -u -V | tail -1)
+          echo "glibc floor: $FLOOR"
+          # Guard the runner-label footgun: anything above 2.35 means someone
+          # bumped the runner and silently broke Debian 12 / RHEL 9 users.
+          if [[ "$(printf '%s\n' "GLIBC_2.35" "$FLOOR" | sort -V | tail -1)" != "GLIBC_2.35" ]]; then
+            echo "::error::glibc floor $FLOOR exceeds GLIBC_2.35 -- check the runner label"
+            exit 1
+          fi
+
+      - name: Package
+        env:
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in ${TARGETS}; do
+            tar -czf "dist/anarlog-cli-${target}.tar.gz" -C "target/${target}/release" anarlog
+          done
+          (cd dist && sha256sum ./*.tar.gz)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.native }}
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, desktop, cli]
+    if: |
+      always()
+      && needs.prepare.outputs.skip == 'false'
+      && needs.desktop.result == 'success'
+      && (needs.cli.result == 'success' || needs.cli.result == 'skipped')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets
+        id: collect
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' -o -name 'anarlog-cli-*.tar.gz' \) \
+            -exec cp {} dist/ \;
+          ls -l dist/
+          TARBALL=$(find dist -name '*.app.tar.gz' | head -1)
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "sig=${TARBALL}.sig" >> "$GITHUB_OUTPUT"
+
+      - name: Generate latest.json
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REPO: ${{ github.repository }}
+          TARBALL_PATH: ${{ steps.collect.outputs.tarball }}
+          SIG_PATH: ${{ steps.collect.outputs.sig }}
+        run: |
           TAG="fork_v${VERSION}"
-          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/$(basename "$TARBALL")"
-          node fork/latest-json.mjs --version "$VERSION" --sig-file "$SIG" --url "$URL" > latest.json
-          cat latest.json
+          URL="https://github.com/${REPO}/releases/download/${TAG}/$(basename "${TARBALL_PATH}")"
+          node fork/latest-json.mjs --version "$VERSION" --sig-file "${SIG_PATH}" --url "$URL" > dist/latest.json
+          cat dist/latest.json
+
+      - name: Compose release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Fork build of upstream \`desktop_v${VERSION}\`, with local Pro-gated features unlocked.
+
+          ## Install the app (Apple Silicon only)
+
+          1. Delete \`/Applications/Anarlog.app\` if you have the official build. This fork keeps the same bundle identifier, so the two cannot coexist.
+          2. Download **\`Anarlog_${VERSION}_aarch64.dmg\`** below and drag it to Applications.
+          3. First launch re-prompts for microphone and system-audio access. That is expected -- the signing Team ID differs from upstream's, so macOS treats it as a new app. Your existing notes database is preserved.
+
+          The app is signed and notarized, and auto-updates from this fork from here on. The other assets (\`.app.tar.gz\`, \`.sig\`, \`latest.json\`) are updater machinery, not downloads.
+
+          On-device transcription via Soniqo or Apple Speech works normally. The Argmax models (ParakeetV2/V3, WhisperLargeV3) will not start in fork builds -- they need a vendor key that isn't available here.
+
+          ## Install the CLI
+
+          \`\`\`sh
+          brew install dave-atx/anarlog/anarlog-cli
+          \`\`\`
+
+          Linux (arm64 and x86_64) and macOS. Unmodified upstream code, built for platforms upstream doesn't publish binaries for. The macOS app already bundles its own copy.
+
+          ---
+
+          Upstream project: https://github.com/fastrepl/anarlog . See [FORK.md](https://github.com/${REPO}/blob/fork/FORK.md) for what this fork changes.
+          EOF
+          cat notes.md
 
       - name: Create GitHub Release
-        if: steps.check-release.outputs.skip == 'false'
         env:
+          VERSION: ${{ needs.prepare.outputs.version }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${{ steps.tag.outputs.version }}"
           TAG="fork_v${VERSION}"
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "fork_v${VERSION}" \
-            --notes "Fork build of upstream desktop_v${VERSION} (arm64, auto-update via fork endpoint)." \
-            "${{ steps.artifacts.outputs.dmg }}" \
-            "${{ steps.artifacts.outputs.tarball }}" \
-            "${{ steps.artifacts.outputs.sig }}" \
-            latest.json
+            --notes-file notes.md \
+            dist/*
+
+      - name: Bump Homebrew tap
+        if: needs.cli.result == 'success'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REPO: ${{ github.repository }}
+          FINGERPRINT: ${{ needs.prepare.outputs.cli-fingerprint }}
+          GH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="fork_v${VERSION}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+
+          declare -A SHA
+          for target in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            SHA[$target]=$(sha256sum "dist/anarlog-cli-${target}.tar.gz" | cut -d' ' -f1)
+          done
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p "tap/$(dirname "$TAP_FORMULA")"
+          cat > "tap/${TAP_FORMULA}" <<EOF
+          # Generated by fork-release.yml. Do not edit by hand.
+          # cli-fingerprint: ${FINGERPRINT}
+          class AnarlogCli < Formula
+            desc "CLI and MCP server for Anarlog meeting notes"
+            homepage "https://github.com/${REPO}"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/anarlog-cli-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA[aarch64-apple-darwin]}"
+              end
+              on_intel do
+                url "${BASE}/anarlog-cli-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA[x86_64-apple-darwin]}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${BASE}/anarlog-cli-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA[aarch64-unknown-linux-gnu]}"
+              end
+              on_intel do
+                url "${BASE}/anarlog-cli-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA[x86_64-unknown-linux-gnu]}"
+              end
+            end
+
+            def install
+              bin.install "anarlog"
+            end
+
+            test do
+              assert_match "anarlog", shell_output("#{bin}/anarlog --version")
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "fork-bot"
+          git config user.email "fork-bot@users.noreply.github.com"
+          # Stage first: on the tap's very first run the formula is untracked,
+          # and `git diff` reports no change for untracked files.
+          git add "$TAP_FORMULA"
+          if git diff --cached --quiet -- "$TAP_FORMULA"; then
+            echo "Formula unchanged -- nothing to push"
+            exit 0
+          fi
+          git commit -m "anarlog-cli ${VERSION}"
+          git push origin HEAD:main
