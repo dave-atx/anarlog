@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **Fork note:** this checkout is dave-atx's fork of `fastrepl/anarlog`. Read `fork/README.md` before doing any fork-related, rebase, release, or build work — it is the complete maintainer/agent handoff. `FORK.md` is the user-facing summary.
+
 # Overview
 
 For Anarlog work, read and follow [.agents/skills/anarlog-workflow/SKILL.md](.agents/skills/anarlog-workflow/SKILL.md). Start requested work immediately; record useful decisions and non-obvious lessons in Linear, not routine execution logs.
