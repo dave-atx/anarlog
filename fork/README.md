@@ -4,6 +4,8 @@ Personal long-lived fork of [`fastrepl/anarlog`](https://github.com/fastrepl/ana
 
 > **Agent note:** this file is the complete handoff. If you are rebasing, building, or debugging the fork, you should not need any other fork-specific doc. The former `fork/PLAN.md` has been folded here and removed.
 
+Two other fork-specific docs exist and are scoped differently: repo-root `FORK.md` is the **user-facing** front door (what the fork does, how to install it) — link people there, not here. Repo-root `README.md` (upstream's, otherwise untouched) carries a fork banner at the very top. That banner must stay a **pure prepend** — content added before upstream's own first line, never interleaved with it — so every nightly rebase carries it forward without a conflict. Don't restructure or move it into the body of the file.
+
 ## 1. What this fork does and does not do
 
 **Unlocked (local, no network required):**
@@ -195,29 +197,71 @@ Because the fork adds no dependencies and no translated strings, none of these s
 
 ## 8. Release CI — `fork-release.yml`
 
-Lives on `fork` (the default branch). Triggers: `schedule: "0 9 * * *"` + `workflow_dispatch`. Permissions `contents: write` + `issues: write`; concurrency group `fork-release`.
+Lives on `fork` (the default branch). Triggers: `schedule: "0 9 * * *"` + `workflow_dispatch` (`force_cli: boolean`, default `false` — forces a CLI rebuild regardless of the fingerprint check in step 6 below). Permissions are least-privilege: the workflow declares `contents: read`, and each job widens only as far as it needs (`prepare` → `contents: write` + `issues: write`, `publish` → `contents: write`, `desktop`/`cli` → `contents: read`). Only `prepare`'s checkout persists credentials; the others set `persist-credentials: false`. Concurrency group `fork-release` (`cancel-in-progress: false`). Top-level `env`: `TAP_REPO=dave-atx/homebrew-anarlog`, `TAP_FORMULA=Formula/anarlog-cli.rb`.
 
-1. Checkout `fetch-depth: 0` + `fetch-tags`. Add `upstream` remote, `git fetch upstream --tags`, set `user.name`/`user.email`.
-2. Resolve newest `desktop_v*` tag via `git tag --list 'desktop_v*' --sort=-v:refname | head -1`. Derive `VERSION=${TAG#desktop_v}`. Version is passed **explicitly** to `scripts/version.sh` — `fork` HEAD sits past the tag so doxxer/tag-describe would not yield the bare version.
-3. Early-exit if `gh release view fork_v$VERSION` already exists.
-4. Rebase `fork` onto `$TAG` (`git rebase --onto "$TAG" "$(git merge-base fork upstream/main)" fork`), force-push. On conflict: `git rebase --abort`, open an issue, fail.
-5. `scripts/version.sh ./apps/desktop/src-tauri/tauri.conf.json $VERSION`, `pnpm -F ui build`, `cargo xtask prepare-binaries`, three `scripts/sidecar.sh` calls (`char-chrome-native-host`, `check-permissions`, `resources/cli/anarlog-cli`), codesign `crates/cloudsync/vendor/cloudsync/macos/<arch>/cloudsync.dylib`, set `SDKROOT`.
-6. Build: `pnpm -F desktop tauri build --target aarch64-apple-darwin --config ./src-tauri/tauri.conf.stable.json --config ./src-tauri/tauri.conf.fork.json` on **`macos-26`** (arm64, free for public repos; replaces upstream's `depot-macos-26` and matches its macOS 26 SDK/Xcode generation). Reuses composite actions `install_desktop_deps` / `rust_install` / `pnpm_install` / `apple_cert` / `macos_notarize_dmg` / `macos_tcc`.
-7. Env on build: `APP_VERSION`, `POSTHOG_API_KEY` (placeholder), `VITE_API_URL`, `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
-8. Notarize + staple DMG, emit `latest.json` via `fork/latest-json.mjs`:
+Four-job DAG. `prepare` does the rebase and gates everything else; `desktop` and `cli` run in parallel and only produce build artifacts (neither creates the release); `publish` assembles both into one release plus the Homebrew tap bump:
 
-   ```sh
-   node fork/latest-json.mjs --version "$VERSION" \
-     --sig-file "$TARBALL.sig" \
-     --url "https://github.com/dave-atx/anarlog/releases/download/fork_v$VERSION/Anarlog.app.tar.gz"
-   ```
+```
+prepare -> desktop (macOS arm64 app)  -\
+        -> cli     (4 CLI binaries)   --> publish (release + Homebrew tap bump)
+```
 
-   ```json
-   { "version": "1.4.16", "pub_date": "<ISO8601>", "platforms": {
-     "darwin-aarch64": { "signature": "<contents of .app.tar.gz.sig>", "url": "<tarball URL>" } } }
-   ```
+Moving the rebase off macOS into `prepare` (ubuntu-24.04) saves macOS runner minutes and lets `desktop` and `cli` start in parallel once it's done, instead of the old single `macos-26` job doing rebase + build + release serially.
 
-9. Publish GitHub Release tagged `fork_v<version>` with **four assets**: DMG (manual installs), `.app.tar.gz`, `.app.tar.gz.sig`, `latest.json`. Also available at `releases/latest/download/latest.json` for the updater. Version is upstream's verbatim (e.g. `1.4.16`); semver build metadata (`1.4.16+fork.2`) is ignored in precedence, so fork-only rebuilds of the same upstream version must be installed by hand.
+**Convention:** every `${{ ... }}` expression lives in a step-level `env:` block, never inline inside a `run:` block — this repo runs zizmor, which flags template injection in `run:`. Preserve this pattern when editing the workflow.
+
+### `prepare` (ubuntu-24.04)
+
+1. Checkout `fetch-depth: 0` + `fetch-tags: true` + `lfs: true`, authenticated with `secrets.FORK_PUSH_TOKEN` (this job is the one that pushes).
+2. Add `upstream` remote, `git fetch upstream --tags --force`, set `user.name`/`user.email`.
+3. Resolve newest `desktop_v*` tag via `git tag --list 'desktop_v*' --sort=-v:refname | head -1`. Derive `VERSION=${TAG#desktop_v}`. Version is passed **explicitly** to `scripts/version.sh` downstream — `fork` HEAD sits past the tag, so tag-describe would not yield the bare version.
+4. Early-exit (`skip=true` output) if `gh release view fork_v$VERSION` already exists.
+5. Rebase `fork` onto `$TAG` (`git rebase --onto "$TAG" "$(git merge-base fork upstream/main)" fork`), force-push (`--force-with-lease`, falling back to plain `--force`). On conflict: `git rebase --abort`, best-effort `gh issue create` (issues are disabled on this repo, so this silently no-ops — check Actions run history for `fork-release` directly), fail the job. Outputs the rebased commit as `sha`.
+6. Fingerprint the CLI's build inputs: `git ls-tree $sha` over `apps/cli`, `crates/agent-access`, `crates/cli-docs`, `crates/cloudsync`, `crates/db-app`, `crates/db-change`, `crates/db-core`, `crates/db-migrate`, `crates/tiptap`, `Cargo.lock`, `Cargo.toml`, `rust-toolchain.toml`, piped through `sha256sum`. This path list mirrors the build-relevant half of `cli_ci.yaml`'s trigger paths — keep the two in sync if upstream edits that workflow. Compares against the `# cli-fingerprint:` comment line in the currently published tap formula (fetched unauthenticated over `raw.githubusercontent.com`). Outputs `cli-changed=true` if `force_cli` was passed, if the tap/formula/comment is missing entirely (first-run bootstrap), or if the fingerprint differs from the previous one; otherwise `cli-changed=false` and the `cli` job is skipped.
+
+Outputs consumed downstream: `tag`, `version`, `skip`, `sha`, `cli-changed`, `cli-fingerprint`.
+
+### `desktop` (macos-26, needs `prepare`, skipped if `prepare.outputs.skip == 'true'`)
+
+Same build/sign/notarize pipeline as before, but it checks out **`ref: needs.prepare.outputs.sha`** (the exact rebased commit `prepare` produced) rather than the `fork` branch, and no longer creates the release itself:
+
+1. `scripts/version.sh ./apps/desktop/src-tauri/tauri.conf.json $VERSION`.
+2. Composite actions `install_desktop_deps` (target macos), `rust_install` (platform macos), `pnpm_install`; set `SDKROOT`.
+3. `pnpm -F ui build`; `cargo xtask prepare-binaries`; three `scripts/sidecar.sh` calls (`char-chrome-native-host`, `check-permissions`, `resources/cli/anarlog-cli`); codesign `crates/cloudsync/vendor/cloudsync/macos/aarch64/cloudsync.dylib` via the `apple_cert` action's cert id.
+4. `pnpm -F desktop tauri build --target aarch64-apple-darwin --config ./src-tauri/tauri.conf.stable.json --config ./src-tauri/tauri.conf.fork.json`, on **`macos-26`** (arm64, free for public repos; replaces upstream's `depot-macos-26` and matches its macOS 26 SDK/Xcode generation). Env (now a step-level `env:` block, per the zizmor convention above): `CI=false`, `GITHUB_TOKEN`, `APP_VERSION`, `POSTHOG_API_KEY` (placeholder), `VITE_POSTHOG_API_KEY`, `SENTRY_DSN`, `CARGO_PROFILE_RELEASE_DEBUG`, `VITE_API_URL`, `VITE_APP_VERSION`, the Apple signing/notarization vars, and `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+5. Notarize + staple the DMG (`macos_notarize_dmg` action).
+6. Stage DMG + `.app.tar.gz` + `.sig` into `dist/` and **upload as a workflow artifact** (`actions/upload-artifact`, name `desktop`, `retention-days: 1`, `if-no-files-found: error`).
+
+### `cli` (matrix, needs `prepare`, skipped unless `skip == 'false' && cli-changed == 'true'`)
+
+Three runners producing four binaries, each checked out at `ref: needs.prepare.outputs.sha`:
+
+| Runner | Targets built | Native target (smoke-tested) |
+|---|---|---|
+| `ubuntu-22.04` | `x86_64-unknown-linux-gnu` | same |
+| `ubuntu-22.04-arm` | `aarch64-unknown-linux-gnu` | same |
+| `macos-26` | `aarch64-apple-darwin` **and** `x86_64-apple-darwin` | `aarch64-apple-darwin` |
+
+The macOS runner builds both Apple targets in the same job — the `rust_install` composite action's `platform: macos` installs both Apple targets, so no dedicated Intel macOS runner is needed.
+
+**Linux binaries build on `ubuntu-22.04`, not `24.04`.** This is the sharpest footgun in this job. Building on 24.04 pins the binary's glibc symbol floor to `GLIBC_2.39` (GCC 13+ emits `__isoc23_*` symbols), which then refuses to run on Ubuntu 22.04, Debian 12, and RHEL 9. `ubuntu-22.04` gives a `GLIBC_2.35` floor instead. This was measured, not assumed — a 24.04-built binary was confirmed to require `GLIBC_2.39`. A `Verify glibc floor` step (Linux runners only) runs `objdump -T` over the built binary and hard-fails if the highest `GLIBC_*` symbol found exceeds `2.35`, specifically to catch a future "modernize the runner label" edit. **Do not change these runner labels without re-verifying this.**
+
+Per matrix leg: `cargo build --locked --release -p anarlog-cli --target <target>` for each target in the leg; smoke test the native binary only (mirrors `cli_ci.yaml`: `--help`, `--version`, `meetings --help`, `mcp --help`, `doctor` against a missing DB reports `"ready": false`, `meetings list --limit 0` reports `"code": "invalid_arguments"` — the cross-built binary can't run on the build host, so it's verified structurally only, by the build succeeding); package each target as `dist/anarlog-cli-<target>.tar.gz` + `sha256sum`; upload as artifact `cli-<native-target>` (`retention-days: 1`, `if-no-files-found: error`).
+
+Skip rationale: each binary is ~24 MiB and upstream ships near-daily, so rebuilding and re-uploading identical bytes every night wastes ~100 MB of release storage per night plus four runner jobs for no behavior change. A missing tap/formula/fingerprint comment is always treated as "changed" so the whole thing self-bootstraps on first run. Force a rebuild regardless of the fingerprint with the `force_cli` `workflow_dispatch` input.
+
+### `publish` (ubuntu-24.04, needs `[prepare, desktop, cli]`)
+
+Runs when `prepare` didn't skip, `desktop` succeeded, and `cli` either succeeded or was skipped (`if: always() && ...` — required because a skipped `cli` would otherwise make this job's default `needs`-success check treat it as not-run).
+
+1. Checkout at `needs.prepare.outputs.sha`; `actions/download-artifact` with no `name:` filter, pulling every upstream job's artifacts into `artifacts/`.
+2. Collect the DMG, `.app.tar.gz`, `.app.tar.gz.sig`, and any `anarlog-cli-*.tar.gz` into `dist/`. When `cli` ran, this means the CLI tarballs ship as GitHub release assets directly, in addition to going to the Homebrew tap in step 6.
+3. Generate `dist/latest.json` via `node fork/latest-json.mjs --version "$VERSION" --sig-file "$SIG" --url "<tarball release URL>"` — same script and shape as before, now invoked from `publish` instead of the old single build job.
+4. Compose human-readable release notes (`notes.md`), replacing the old one-line machine-generated body: DMG install instructions (delete `/Applications/Anarlog.app` first — same bundle identifier, the two builds cannot coexist; arm64 only; expect mic/system-audio re-prompts since the signing Team ID differs from upstream's), `brew install dave-atx/anarlog/anarlog-cli` for the CLI, a note that the Argmax STT models (ParakeetV2/V3, WhisperLargeV3) will not start in fork builds, and links to upstream and `FORK.md`.
+5. `gh release create fork_v$VERSION --notes-file notes.md dist/*` — ships every asset collected in step 2. Version is upstream's verbatim (e.g. `1.4.16`); semver build metadata (`1.4.16+fork.2`) is ignored in precedence, so fork-only rebuilds of the same upstream version must be installed by hand. Also available at `releases/latest/download/latest.json` for the updater.
+6. **Bump Homebrew tap** (only if `needs.cli.result == 'success'` — a skipped or failed `cli` leaves the tap formula untouched): compute sha256 for all four `anarlog-cli-*.tar.gz`, clone `dave-atx/homebrew-anarlog` using `secrets.TAP_PUSH_TOKEN`, write a fully generated `Formula/anarlog-cli.rb` (carries a "Generated by fork-release.yml. Do not edit by hand." header, `on_macos`/`on_linux` × `on_arm`/`on_intel` blocks pointing at this release's assets and their sha256 sums, one `# cli-fingerprint: <hash>` comment line carrying this run's fingerprint, `version` tracking upstream's app version), stage + commit only if the formula content actually changed, push to `main`. **No cask** — the tap ships the CLI only, deliberately; there's no desktop-app entry.
+
+If `TAP_PUSH_TOKEN` is missing or wrong, step 6 fails but step 5 has already run — the release itself still publishes successfully.
 
 ### GitHub repo setup (one-time)
 
@@ -251,6 +295,8 @@ Repository secrets / variables:
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | secret | key password (must be **non-empty** — GitHub rejects empty secret values; generate with `pnpm exec tauri signer generate -w fork/updater.key`) |
 | `POSTHOG_API_KEY` | secret | placeholder starting `phc_` e.g. `phc_local_fork_no_telemetry_0000000000` |
 | `VITE_API_URL` | variable | `https://api.anarlog.so` |
+| `FORK_PUSH_TOKEN` | secret | fine-grained PAT, Contents RW + Workflows RW on `dave-atx/anarlog`, no expiration — used by `prepare`'s checkout/push. GitHub blocks the default `GITHUB_TOKEN` from pushing any diff that touches `.github/workflows/*`, which trips whenever upstream edits its own workflow files and the nightly rebase carries that onto `fork` |
+| `TAP_PUSH_TOKEN` | secret | fine-grained PAT, Contents RW on `dave-atx/homebrew-anarlog` only — new for the tap bump in `publish`. `FORK_PUSH_TOKEN` is scoped to this repo and cannot push there; without `TAP_PUSH_TOKEN` the tap bump step fails but the rest of the release still succeeds |
 
 First run via `workflow_dispatch` before trusting the cron. Public-repo crons auto-disable after 60 days without repo activity — the daily force-push should keep it alive.
 
@@ -269,7 +315,7 @@ pnpm exec tauri signer generate -w fork/updater.key
 | Script | Purpose |
 |---|---|
 | `fork/update.sh` | Local rebase helper — fetches `upstream --tags`, resolves newest `desktop_v*`, rebases `fork` onto it, aborts with a clear message on conflict |
-| `fork/latest-json.mjs` | Emits the Tauri updater manifest from the `.app.tar.gz.sig` contents — see §8 for invocation |
+| `fork/latest-json.mjs` | Emits the Tauri updater manifest from the `.app.tar.gz.sig` contents — invoked from the `publish` job, see §8 |
 
 ## 11. Telemetry and upstream hosts baked into the app
 
@@ -289,7 +335,7 @@ pnpm exec tauri signer generate -w fork/updater.key
 - Argmax STT models not starting — expected without `AM_API_KEY` (§3); use Soniqo / Apple Speech.
 - First launch re-prompts mic/system-audio TCC and orphans Keychain items — expected after Team ID change (§5).
 - `pnpm fmt:check` reports ~67 Swift failures on Linux ("Cannot start formatter") — macOS-only `swift format` via `dprint`; not real diffs.
-- If no new `desktop_v*` release appears, verify cron is still enabled (forks disable `schedule` by default; public crons auto-disable after 60 days of inactivity) and that `fork` is still the default branch. Manual fallback: `gh workflow run fork-release.yml` or a `repository_dispatch` from another repo. Only one workflow run has occurred so far / no new upstream tags since `desktop_v1.4.15` — cron has not yet been end-to-end verified.
+- If no new `desktop_v*` release appears, verify cron is still enabled (forks disable `schedule` by default; public crons auto-disable after 60 days of inactivity) and that `fork` is still the default branch. Manual fallback: `gh workflow run fork-release.yml` or a `repository_dispatch` from another repo. Cron is end-to-end verified — it has fired successfully at least three times, producing `fork_v1.4.15` (2026-08-30), `fork_v1.4.16` (2026-09-02), and `fork_v1.4.17` (2026-09-03).
 
 ## 13. Risks and maintenance notes
 
@@ -309,10 +355,13 @@ Repo root `LICENSE` is MIT, `Copyright (c) 2023-present Fastrepl, Inc.` `LICENSI
 - [ ] Merged tauri config carries the **fork** updater pubkey, not upstream's
 - [ ] DMG is notarized and stapled (`xcrun stapler validate`), `spctl -a -t open --context context:primary-signature` accepts it
 - [ ] `latest.json` resolves at `releases/latest/download/latest.json` without auth
-- [ ] Release carries all **four** assets (DMG, `.app.tar.gz`, `.app.tar.gz.sig`, `latest.json`) and `latest.json`'s `url` points at the `.app.tar.gz`, not the DMG
+- [ ] Release carries all **four** desktop assets (DMG, `.app.tar.gz`, `.app.tar.gz.sig`, `latest.json`) and `latest.json`'s `url` points at the `.app.tar.gz`, not the DMG
 - [ ] CI-built DMG (not just a local build) shows Dictionary, Automations, Templates, custom app icon, and variable playback speed with no paywall while signed out
 - [ ] First launch: mic/system-audio re-prompts (expected) and existing notes database loads intact
 - [ ] Sync shows "Sign in to use cloud sync" (inert, not crashed)
 - [ ] On-device STT works via Soniqo or Apple Speech (Argmax models expected to fail — §3)
 - [ ] Second run against a newer upstream tag delivers an in-app update
+- [ ] On a `cli-changed` run, all four `anarlog-cli-<target>.tar.gz` assets (Linux x86_64/aarch64, macOS aarch64/x86_64) are attached to the release
+- [ ] `brew install dave-atx/anarlog/anarlog-cli` succeeds and `anarlog --version` runs, on both a Linux and a macOS host
+- [ ] Tap formula's `# cli-fingerprint:` line matches the fingerprint `prepare` computed for this run (confirms the next run's skip check won't false-positive)
 
