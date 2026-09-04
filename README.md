@@ -1,3 +1,12 @@
+> [!IMPORTANT]
+> **This is `dave-atx/anarlog`, a personal fork — not the upstream project.** Its only deviation from upstream is unlocking local, on-device Pro features without a subscription; see [FORK.md](FORK.md).
+>
+> - Download the latest build (DMG, macOS arm64 only): [github.com/dave-atx/anarlog/releases/latest](https://github.com/dave-atx/anarlog/releases/latest)
+> - CLI: `brew install dave-atx/anarlog/anarlog-cli`
+> - Fork details for maintainers/agents: [fork/README.md](fork/README.md)
+>
+> Looking for the official app instead? Go to upstream: **[fastrepl/anarlog](https://github.com/fastrepl/anarlog)**.
+
 > **Note:** The team is now building **[char](https://char.com)**. The **anarlog** community application remains open-source, MIT-licensed, and maintained as the local-first meeting notetaker in this repo. Source-visible enterprise components are commercially licensed.
 
 <div align="center">
