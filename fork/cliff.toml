@@ -1,0 +1,35 @@
+# git-cliff config for the fork's CLI release notes.
+# Scope is set by --include-path on the command line (mirrors CLI_PATHS in
+# .github/workflows/fork-release.yml); this file only decides wording.
+
+[changelog]
+header = ""
+body = """
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }}
+{%- endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+protect_breaking_commits = false
+topo_order = false
+# One flat list for the whole range: without this git-cliff renders `body` once
+# per tag it finds inside the range (a missed cron day spans two upstream tags).
+ignore_tags = ".*"
+sort_commits = "oldest"
+
+# Upstream commits end with "(#1234)". Turn that into a link to the upstream PR.
+commit_preprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/fastrepl/anarlog/pull/${1}))" },
+]
+
+# The body template above doesn't render per-group headings -- this catch-all
+# just ensures non-conventional upstream commits aren't dropped by git-cliff's
+# parser instead of actually grouping anything.
+commit_parsers = [
+  { message = ".*", group = "Changed" },
+]
