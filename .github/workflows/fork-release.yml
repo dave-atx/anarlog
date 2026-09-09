@@ -48,6 +48,13 @@ concurrency:
 env:
   TAP_REPO: dave-atx/homebrew-anarlog
   TAP_FORMULA: Formula/anarlog-cli.rb
+  # Mirrors the build-relevant half of cli_ci.yaml's trigger paths -- keep in
+  # sync when upstream edits that workflow. Order matters: the fingerprint
+  # step's `git ls-tree` output (and thus the hash) depends on it.
+  CLI_PATHS: >-
+    apps/cli crates/agent-access crates/cli-docs crates/cloudsync
+    crates/db-app crates/db-change crates/db-core crates/db-migrate
+    crates/tiptap Cargo.lock Cargo.toml rust-toolchain.toml
 
 jobs:
   prepare:
@@ -65,6 +72,7 @@ jobs:
       sha: ${{ steps.rebase.outputs.sha }}
       cli-changed: ${{ steps.cli-fingerprint.outputs.changed }}
       cli-fingerprint: ${{ steps.cli-fingerprint.outputs.fingerprint }}
+      cli-notes-since: ${{ steps.cli-notes.outputs.cli-notes-since }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,20 +150,10 @@ jobs:
           HEAD_SHA: ${{ steps.rebase.outputs.sha }}
           FORCE_CLI: ${{ inputs.force_cli }}
         run: |
-          FINGERPRINT=$(git ls-tree "${HEAD_SHA}" \
-            apps/cli \
-            crates/agent-access \
-            crates/cli-docs \
-            crates/cloudsync \
-            crates/db-app \
-            crates/db-change \
-            crates/db-core \
-            crates/db-migrate \
-            crates/tiptap \
-            Cargo.lock \
-            Cargo.toml \
-            rust-toolchain.toml \
-            | sha256sum | cut -d' ' -f1)
+          # $CLI_PATHS is deliberately unquoted here so it word-splits into
+          # separate git ls-tree arguments (same order as the workflow-level
+          # env above).
+          FINGERPRINT=$(git ls-tree "${HEAD_SHA}" $CLI_PATHS | sha256sum | cut -d' ' -f1)
           echo "fingerprint=$FINGERPRINT" >> "$GITHUB_OUTPUT"
 
           # The previously published fingerprint lives as a comment in the tap
@@ -177,6 +175,83 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "CLI changed: $PREVIOUS -> $FINGERPRINT"
           fi
+
+      # Human-readable "what changed in the CLI" notes for the release body.
+      # Best-effort throughout: a notes failure must never fail the release.
+      - name: Generate CLI release notes
+        id: cli-notes
+        if: steps.check-release.outputs.skip == 'false'
+        env:
+          CURRENT_TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          : > cli-notes.md
+
+          # --- install the pinned git-cliff release (not cargo install, not
+          # a third-party action -- this job holds FORK_PUSH_TOKEN) ---
+          GIT_CLIFF_VERSION="2.14.1"
+          GIT_CLIFF_ASSET="git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-gnu"
+          if curl -fsSL -o /tmp/git-cliff.tar.gz \
+              "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/${GIT_CLIFF_ASSET}.tar.gz" \
+              && sudo tar -xzf /tmp/git-cliff.tar.gz --strip-components=1 -C /usr/local/bin "${GIT_CLIFF_ASSET%-x86_64-unknown-linux-gnu}/git-cliff"; then
+            :
+          else
+            echo "::warning::failed to install git-cliff -- shipping without CLI notes"
+            echo "cli-notes-since=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- resolve the previous released version ---
+          PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("fork_v"))] | sort_by(.createdAt) | reverse | .[0].tagName' 2>/dev/null || true)
+          PREV_DESKTOP_TAG=""
+          if [[ -n "$PREV_TAG" ]]; then
+            CANDIDATE="desktop_v${PREV_TAG#fork_v}"
+            if git rev-parse --verify --quiet "refs/tags/${CANDIDATE}" >/dev/null; then
+              PREV_DESKTOP_TAG="$CANDIDATE"
+            fi
+          fi
+          if [[ -z "$PREV_DESKTOP_TAG" ]]; then
+            # Fallback: second-newest desktop_v* tag (the newest is $CURRENT_TAG
+            # itself, not yet released).
+            PREV_DESKTOP_TAG=$(git for-each-ref --format='%(refname:strip=2)' --sort=-v:refname 'refs/tags/desktop_v*' | sed -n '2p')
+          fi
+
+          if [[ -z "$PREV_DESKTOP_TAG" ]]; then
+            echo "No previous release found -- shipping without CLI notes"
+            echo "cli-notes-since=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PREV_VERSION="${PREV_DESKTOP_TAG#desktop_v}"
+          echo "cli-notes-since=${PREV_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # Build --include-path args from $CLI_PATHS: both the bare path (for
+          # plain files like Cargo.lock) and a /** glob (for directories) --
+          # set -f keeps the ** unexpanded by the shell so git-cliff sees it.
+          set -f
+          INCLUDE_ARGS=()
+          for p in $CLI_PATHS; do
+            INCLUDE_ARGS+=(--include-path "$p" --include-path "${p}/**")
+          done
+          set +f
+
+          if ! git-cliff --config fork/cliff.toml "${INCLUDE_ARGS[@]}" \
+              "${PREV_DESKTOP_TAG}..${CURRENT_TAG}" > cli-notes.md 2>/tmp/cli-notes.err; then
+            echo "::warning::git-cliff failed -- shipping without CLI notes"
+            cat /tmp/cli-notes.err || true
+            : > cli-notes.md
+          fi
+          echo "--- cli-notes.md (since ${PREV_DESKTOP_TAG}) ---"
+          cat cli-notes.md
+
+      - uses: actions/upload-artifact@v4
+        if: steps.check-release.outputs.skip == 'false'
+        with:
+          name: cli-notes
+          path: cli-notes.md
+          if-no-files-found: error
 
   desktop:
     needs: prepare
@@ -461,10 +536,41 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
           REPO: ${{ github.repository }}
+          CLI_NOTES_SINCE: ${{ needs.prepare.outputs.cli-notes-since }}
+          CLI_CHANGED: ${{ needs.prepare.outputs.cli-changed }}
         run: |
           set -euo pipefail
+
+          # Upstream's changelog file lags the tag by hours -- probe whether
+          # it exists yet (a curl failure here must never fail this step).
+          CHANGELOG_RAW_URL="https://raw.githubusercontent.com/fastrepl/anarlog/main/packages/changelog/content/${VERSION}.md"
+          if curl -fsSL -o /dev/null "$CHANGELOG_RAW_URL" 2>/dev/null; then
+            UPSTREAM_NOTES_URL="https://github.com/fastrepl/anarlog/blob/main/packages/changelog/content/${VERSION}.md"
+          else
+            UPSTREAM_NOTES_URL="https://github.com/fastrepl/anarlog/releases/tag/desktop_v${VERSION}"
+          fi
+
+          # CLI-changes subsection: real bullets when the CLI actually changed
+          # and git-cliff produced something, otherwise a one-line "unchanged".
+          CLI_NOTES_FILE="artifacts/cli-notes/cli-notes.md"
+          if [[ -s "$CLI_NOTES_FILE" && "$CLI_CHANGED" == "true" ]]; then
+            CLI_SECTION="### CLI changes since ${CLI_NOTES_SINCE}
+
+          $(sed '/./,$!d' "$CLI_NOTES_FILE")
+
+          Upstream changes since \`desktop_v${CLI_NOTES_SINCE}\` that affect the CLI build."
+          elif [[ "$CLI_CHANGED" == "true" ]]; then
+            # Rebuilt, but note generation produced nothing -- don't claim the
+            # binaries are unchanged when they aren't.
+            CLI_SECTION="The CLI was rebuilt for this release. See the upstream release notes above for what changed."
+          else
+            CLI_SECTION="The CLI is unchanged in this release; \`brew install\` still serves the previous version's binaries."
+          fi
+
           cat > notes.md <<EOF
           Fork build of upstream \`desktop_v${VERSION}\`, with local Pro-gated features unlocked.
+
+          Upstream release notes: ${UPSTREAM_NOTES_URL}
 
           ## Install the app (Apple Silicon only)
 
@@ -483,6 +589,8 @@ jobs:
           \`\`\`
 
           Linux (arm64 and x86_64) and macOS. Unmodified upstream code, built for platforms upstream doesn't publish binaries for. The macOS app already bundles its own copy.
+
+          ${CLI_SECTION}
 
           ---
 
