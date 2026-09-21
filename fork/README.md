@@ -199,7 +199,7 @@ Because the fork adds no dependencies and no translated strings, none of these s
 
 ## 8. Release CI — `fork-release.yml`
 
-Lives on `fork` (the default branch). Triggers: `schedule: "0 9 * * *"` + `workflow_dispatch` (`force_cli: boolean`, default `false` — forces a CLI rebuild regardless of the fingerprint check in step 6 below). Permissions are least-privilege: the workflow declares `contents: read`, and each job widens only as far as it needs (`prepare` → `contents: write` + `issues: write`, `publish` → `contents: write`, `desktop`/`cli` → `contents: read`). Only `prepare`'s checkout persists credentials; the others set `persist-credentials: false`. Concurrency group `fork-release` (`cancel-in-progress: false`). Top-level `env`: `TAP_REPO=dave-atx/homebrew-anarlog`, `TAP_FORMULA=Formula/anarlog-cli.rb`.
+Lives on `fork` (the default branch). Triggers: `schedule: "17 * * * *"` (hourly, off-peak minute — GitHub delays top-of-the-hour crons by hours, and the old daily poll missed a release by a full day) + `workflow_dispatch` (`force_cli: boolean`, default `false` — forces a CLI rebuild regardless of the fingerprint check in step 6 below). Permissions are least-privilege: the workflow declares `contents: read`, and each job widens only as far as it needs (`prepare` → `contents: write` + `issues: write`, `publish` → `contents: write`, `desktop`/`cli` → `contents: read`). Only `prepare`'s checkout persists credentials; the others set `persist-credentials: false`. Concurrency group `fork-release` (`cancel-in-progress: false`). Top-level `env`: `TAP_REPO=dave-atx/homebrew-anarlog`, `TAP_FORMULA=Formula/anarlog-cli.rb`.
 
 Four-job DAG. `prepare` does the rebase and gates everything else; `desktop` and `cli` run in parallel and only produce build artifacts (neither creates the release); `publish` assembles both into one release plus the Homebrew tap bump:
 
@@ -208,19 +208,25 @@ prepare -> desktop (macOS arm64 app)  -\
         -> cli     (4 CLI binaries)   --> publish (release + Homebrew tap bump)
 ```
 
-Moving the rebase off macOS into `prepare` (ubuntu-24.04) saves macOS runner minutes and lets `desktop` and `cli` start in parallel once it's done, instead of the old single `macos-26` job doing rebase + build + release serially.
+Moving the rebase off macOS into `prepare` (ubuntu-slim) saves macOS runner minutes and lets `desktop` and `cli` start in parallel once it's done, instead of the old single `macos-26` job doing rebase + build + release serially.
+
+**Action versions:** this workflow's own actions are on Node 24 majors (`actions/checkout@v7`, `actions/upload-artifact@v7`, `actions/download-artifact@v8`). The `desktop` job still shows GitHub's "Node.js 20 is deprecated" annotation for `pnpm/action-setup@v4` and `actions/setup-node@v4`, which come from upstream's `pnpm_install` composite. That is accepted on purpose: patching an upstream-owned file risks a rebase conflict, which aborts CI silently (issues are disabled). `rust_install` (`Swatinem/rust-cache@v2`, `dtolnay/rust-toolchain@master`) is already clean. To audit: `gh api repos/dave-atx/anarlog/check-runs/<job-id>/annotations`.
 
 **Convention:** every `${{ ... }}` expression lives in a step-level `env:` block, never inline inside a `run:` block — this repo runs zizmor, which flags template injection in `run:`. Preserve this pattern when editing the workflow.
 
-### `prepare` (ubuntu-24.04)
+### `prepare` (ubuntu-slim)
 
-1. Checkout `fetch-depth: 0` + `fetch-tags: true` + `lfs: true`, authenticated with `secrets.FORK_PUSH_TOKEN` (this job is the one that pushes).
-2. Add `upstream` remote, `git fetch upstream --tags --force`, set `user.name`/`user.email`.
-3. Resolve newest `desktop_v*` tag via `git tag --list 'desktop_v*' --sort=-v:refname | head -1`. Derive `VERSION=${TAG#desktop_v}`. Version is passed **explicitly** to `scripts/version.sh` downstream — `fork` HEAD sits past the tag, so tag-describe would not yield the bare version.
-4. Early-exit (`skip=true` output) if `gh release view fork_v$VERSION` already exists.
+`ubuntu-slim` is GitHub's 1-vCPU container runner with a hard, non-overridable 15-minute job limit. A real rebase run takes about a minute, and the image has `git`, `git-lfs`, `gh`, `curl`, and `sudo`. Move `prepare` back to `ubuntu-24.04` if it ever approaches the limit.
+
+Steps 1–2 run **before any checkout**, so an hourly poll with nothing new costs a few seconds. Steps 3 onward are all gated on `skip == 'false'`.
+
+1. Resolve the newest upstream `desktop_v*` tag over the network with `git ls-remote --tags --refs --sort=-v:refname https://github.com/fastrepl/anarlog.git 'desktop_v*'` (captured into a variable, then trimmed with `sed`, so `head` can't SIGPIPE git under `pipefail`). Derive `VERSION=${TAG#desktop_v}`. Version is passed **explicitly** to `scripts/version.sh` downstream — `fork` HEAD sits past the tag, so tag-describe would not yield the bare version.
+2. Early-exit (`skip=true` output) if `gh release view fork_v$VERSION` already exists.
+3. Checkout `fetch-depth: 0` + `fetch-tags: true` + `lfs: true`, authenticated with `secrets.FORK_PUSH_TOKEN` (this job is the one that pushes).
+4. Add `upstream` remote, `git fetch upstream --tags --force`, set `user.name`/`user.email`.
 5. Rebase `fork` onto `$TAG` (`git rebase --onto "$TAG" "$(git merge-base fork upstream/main)" fork`), force-push (`--force-with-lease`, falling back to plain `--force`). On conflict: `git rebase --abort`, best-effort `gh issue create` (issues are disabled on this repo, so this silently no-ops — check Actions run history for `fork-release` directly), fail the job. Outputs the rebased commit as `sha`.
 6. Fingerprint the CLI's build inputs: `git ls-tree $sha $CLI_PATHS`, piped through `sha256sum`. `CLI_PATHS` is a workflow-level `env` var (`apps/cli`, `crates/agent-access`, `crates/cli-docs`, `crates/cloudsync`, `crates/db-app`, `crates/db-change`, `crates/db-core`, `crates/db-migrate`, `crates/tiptap`, `Cargo.lock`, `Cargo.toml`, `rust-toolchain.toml`, space-separated, deliberately unquoted at the call site so it word-splits) — shared with the CLI-notes step below so both scopes stay in sync by construction. This path list mirrors the build-relevant half of `cli_ci.yaml`'s trigger paths — keep the two in sync if upstream edits that workflow. Compares against the `# cli-fingerprint:` comment line in the currently published tap formula (fetched unauthenticated over `raw.githubusercontent.com`). Outputs `cli-changed=true` if `force_cli` was passed, if the tap/formula/comment is missing entirely (first-run bootstrap), or if the fingerprint differs from the previous one; otherwise `cli-changed=false` and the `cli` job is skipped.
-7. Generate CLI-only release notes (best-effort — a failure here never fails the release): install a pinned `git-cliff` v2.14.1 release tarball to `/usr/local/bin` (not `orhun/git-cliff-action`, not `cargo install` — this job holds `FORK_PUSH_TOKEN`); resolve the previous released version from `gh release list` (newest `fork_v*`, falling back to the second-newest `desktop_v*` tag if that doesn't resolve); run `git-cliff --config fork/cliff.toml` scoped to `$CLI_PATHS` (via paired `--include-path <p>`/`--include-path <p>/**` args) over the range `<prev desktop tag>..<current tag>`; write the result to `cli-notes.md` (always created, even empty) and upload it as artifact `cli-notes`. Outputs the previous version as `cli-notes-since`.
+7. Generate CLI-only release notes (best-effort — a failure here never fails the release): install a pinned `git-cliff` v2.14.1 release tarball into `$RUNNER_TEMP/bin` (no `sudo`, so it works on any runner; not `orhun/git-cliff-action`, not `cargo install` — this job holds `FORK_PUSH_TOKEN`); resolve the previous released version from `gh release list` (newest `fork_v*`, falling back to the second-newest `desktop_v*` tag if that doesn't resolve); run `git-cliff --config fork/cliff.toml` scoped to `$CLI_PATHS` (via paired `--include-path <p>`/`--include-path <p>/**` args) over the range `<prev desktop tag>..<current tag>`; write the result to `cli-notes.md` (always created, even empty) and upload it as artifact `cli-notes`. Outputs the previous version as `cli-notes-since`.
 
 Outputs consumed downstream: `tag`, `version`, `skip`, `sha`, `cli-changed`, `cli-fingerprint`, `cli-notes-since`.
 
@@ -301,7 +307,7 @@ Repository secrets / variables:
 | `FORK_PUSH_TOKEN` | secret | fine-grained PAT, Contents RW + Workflows RW on `dave-atx/anarlog`, no expiration — used by `prepare`'s checkout/push. GitHub blocks the default `GITHUB_TOKEN` from pushing any diff that touches `.github/workflows/*`, which trips whenever upstream edits its own workflow files and the nightly rebase carries that onto `fork` |
 | `TAP_PUSH_TOKEN` | secret | fine-grained PAT, Contents RW on `dave-atx/homebrew-anarlog` only — new for the tap bump in `publish`. `FORK_PUSH_TOKEN` is scoped to this repo and cannot push there; without `TAP_PUSH_TOKEN` the tap bump step fails but the rest of the release still succeeds |
 
-First run via `workflow_dispatch` before trusting the cron. Public-repo crons auto-disable after 60 days without repo activity — the daily force-push should keep it alive.
+First run via `workflow_dispatch` before trusting the cron. Public-repo crons auto-disable after 60 days without repo activity — the force-push on each new release should keep it alive.
 
 ## 9. Updater keypair
 
@@ -347,7 +353,7 @@ pnpm exec tauri signer generate -w fork/updater.key
 - Fork-only rebuilds of the same upstream version cannot ship through the updater (version is upstream's verbatim; semver build metadata is ignored in precedence) — install by hand.
 - `billing-context.ts` conflicts are the main recurring cost; `rerere` absorbs most. If upstream restructures the hook, re-derive the seam from §2 rather than force-fitting the old diff.
 - The ungating patch is publicly readable — MIT permits this (owner's accepted tradeoff for free macOS runners and auth-free assets).
-- Upstream ships near-daily (`desktop_v1.4.0` 2026-08-01 → `v1.4.15` 2026-08-29), so expect a build and update toast most days — switch the cron to weekly if noisy.
+- Upstream ships near-daily (`desktop_v1.4.0` 2026-08-01 → `v1.4.15` 2026-08-29), so expect a build and update toast most days. The hourly poll picks a release up within roughly an hour of upstream tagging it (plus GitHub's cron delay), and each no-op poll is a few seconds of `ubuntu-slim`.
 
 ## 14. Licensing
 
