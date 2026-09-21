@@ -1,4 +1,4 @@
-# Fork-only automation: nightly force-rebases the `fork` branch onto the latest
+# Fork-only automation: force-rebases the `fork` branch onto the latest
 # upstream desktop_v* tag and builds/publishes a release. Don't treat `fork` as a
 # stable integration branch. This file has no upstream counterpart, so it's a safe
 # place to record fork-maintenance notes without risking rebase conflicts.
@@ -13,12 +13,23 @@
 #   from pushing any diff that touches .github/workflows/* ("refusing to allow a
 #   GitHub App to create or update workflow ... without `workflows` permission").
 #   This trips whenever upstream edits any of its own workflow files, which the
-#   nightly rebase then carries onto `fork`.
+#   rebase then carries onto `fork`.
 # - The tap bump needs `secrets.TAP_PUSH_TOKEN` (fine-grained PAT, Contents RW on
 #   dave-atx/homebrew-anarlog). A PAT scoped only to this repo cannot push there.
 # - Issues are disabled on this repo, so the `gh issue create` conflict alert
 #   below silently no-ops on failure. A real rebase conflict won't page anyone --
 #   check the Actions run history for fork-release directly.
+# - The cron polls hourly at an off-peak minute; GitHub delays scheduled runs by
+#   hours at the top of the hour, and a daily poll can miss a release by a day.
+#   `prepare` resolves the upstream tag over the network and checks for our
+#   release BEFORE any checkout, so a poll with nothing new is a few seconds on
+#   ubuntu-slim. Everything else in `prepare` is gated on that check.
+# - `prepare` runs on ubuntu-slim (1 vCPU container, hard 15 min job limit). A
+#   real rebase run takes ~1 min. Move it back to ubuntu-24.04 if that changes.
+# - Keep this file's own actions on Node 24 majors (checkout v7, upload-artifact
+#   v7, download-artifact v8). Upstream's pnpm_install composite still pins the
+#   Node 20 v4s of pnpm/action-setup and setup-node; that Node 20 annotation on
+#   the desktop job is accepted rather than patching an upstream-owned file.
 # - Linux CLI binaries build on ubuntu-22.04 (glibc 2.35), NOT 24.04. Building on
 #   24.04 pins the binary's symbol floor to GLIBC_2.39 (GCC 13+ emits __isoc23_*),
 #   which refuses to run on Ubuntu 22.04 / Debian 12 / RHEL 9. Do not "modernize"
@@ -30,7 +41,7 @@
 name: fork-release
 on:
   schedule:
-    - cron: "0 9 * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       force_cli:
@@ -58,7 +69,7 @@ env:
 
 jobs:
   prepare:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-slim
     permissions:
       contents: write
       issues: write
@@ -74,24 +85,15 @@ jobs:
       cli-fingerprint: ${{ steps.cli-fingerprint.outputs.fingerprint }}
       cli-notes-since: ${{ steps.cli-notes.outputs.cli-notes-since }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-          lfs: true
-          token: ${{ secrets.FORK_PUSH_TOKEN }}
-
-      - name: Set up upstream remote
-        run: |
-          git remote add upstream https://github.com/fastrepl/anarlog.git 2>/dev/null || true
-          git fetch upstream --tags --force
-          git config user.name "fork-bot"
-          git config user.email "fork-bot@users.noreply.github.com"
-
+      # No checkout yet: ask upstream for its newest desktop_v* tag directly and
+      # see whether we already released it. Most hourly polls end here.
       - name: Resolve latest upstream tag
         id: tag
         run: |
-          TAG=$(git for-each-ref --format='%(refname:strip=2)' --sort=-v:refname --count=1 'refs/tags/desktop_v*')
+          # Capture first, trim second: `head` closing the pipe early would
+          # SIGPIPE git under pipefail.
+          REFS=$(git ls-remote --tags --refs --sort=-v:refname https://github.com/fastrepl/anarlog.git 'desktop_v*')
+          TAG=$(sed -n '1s|.*refs/tags/||p' <<<"$REFS")
           if [[ -z "$TAG" ]]; then
             echo "::error::No desktop_v* tag found"
             exit 1
@@ -114,6 +116,22 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - uses: actions/checkout@v7
+        if: steps.check-release.outputs.skip == 'false'
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          lfs: true
+          token: ${{ secrets.FORK_PUSH_TOKEN }}
+
+      - name: Set up upstream remote
+        if: steps.check-release.outputs.skip == 'false'
+        run: |
+          git remote add upstream https://github.com/fastrepl/anarlog.git 2>/dev/null || true
+          git fetch upstream --tags --force
+          git config user.name "fork-bot"
+          git config user.email "fork-bot@users.noreply.github.com"
 
       - name: Rebase fork onto upstream tag
         id: rebase
@@ -188,14 +206,16 @@ jobs:
           set -uo pipefail
           : > cli-notes.md
 
-          # --- install the pinned git-cliff release (not cargo install, not
-          # a third-party action -- this job holds FORK_PUSH_TOKEN) ---
+          # --- install the pinned git-cliff release into $RUNNER_TEMP (no sudo;
+          # not cargo install, not a third-party action -- this job holds
+          # FORK_PUSH_TOKEN) ---
           GIT_CLIFF_VERSION="2.14.1"
           GIT_CLIFF_ASSET="git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-gnu"
           if curl -fsSL -o /tmp/git-cliff.tar.gz \
               "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/${GIT_CLIFF_ASSET}.tar.gz" \
-              && sudo tar -xzf /tmp/git-cliff.tar.gz --strip-components=1 -C /usr/local/bin "${GIT_CLIFF_ASSET%-x86_64-unknown-linux-gnu}/git-cliff"; then
-            :
+              && mkdir -p "$RUNNER_TEMP/bin" \
+              && tar -xzf /tmp/git-cliff.tar.gz --strip-components=1 -C "$RUNNER_TEMP/bin" "${GIT_CLIFF_ASSET%-x86_64-unknown-linux-gnu}/git-cliff"; then
+            export PATH="$RUNNER_TEMP/bin:$PATH"
           else
             echo "::warning::failed to install git-cliff -- shipping without CLI notes"
             echo "cli-notes-since=" >> "$GITHUB_OUTPUT"
@@ -246,7 +266,7 @@ jobs:
           echo "--- cli-notes.md (since ${PREV_DESKTOP_TAG}) ---"
           cat cli-notes.md
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.check-release.outputs.skip == 'false'
         with:
           name: cli-notes
@@ -263,7 +283,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
@@ -368,7 +388,7 @@ jobs:
           cp "${TARBALL_PATH}" dist/
           cp "${SIG_PATH}" dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: desktop
           path: dist/
@@ -401,7 +421,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           submodules: recursive
@@ -478,7 +498,7 @@ jobs:
             (cd dist && shasum -a 256 ./*.tar.gz)
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.native }}
           path: dist/
@@ -499,12 +519,12 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
