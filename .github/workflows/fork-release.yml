@@ -16,9 +16,8 @@
 #   rebase then carries onto `fork`.
 # - The tap bump needs `secrets.TAP_PUSH_TOKEN` (fine-grained PAT, Contents RW on
 #   dave-atx/homebrew-anarlog). A PAT scoped only to this repo cannot push there.
-# - Issues are disabled on this repo, so the `gh issue create` conflict alert
-#   below silently no-ops on failure. A real rebase conflict won't page anyone --
-#   check the Actions run history for fork-release directly.
+# - A rebase conflict fails `prepare`; GitHub's workflow-failure email is the
+#   alert. The hourly poll retries (and re-fails) until it is resolved locally.
 # - The cron polls hourly at an off-peak minute; GitHub delays scheduled runs by
 #   hours at the top of the hour, and a daily poll can miss a release by a day.
 #   `prepare` resolves the upstream tag over the network and checks for our
@@ -72,7 +71,6 @@ jobs:
     runs-on: ubuntu-slim
     permissions:
       contents: write
-      issues: write
     defaults:
       run:
         shell: bash
@@ -146,8 +144,7 @@ jobs:
             echo "Rebasing fork onto $TAG (old base $OLD_BASE)"
             if ! git rebase --onto "$TAG" "$OLD_BASE" fork; then
               git rebase --abort || true
-              echo "::error::Rebase conflict onto $TAG -- resolve locally"
-              gh issue create --title "fork rebase conflict onto $TAG" --body "Automated rebase failed. Resolve locally: git fetch upstream --tags && git rebase --onto $TAG \$(git merge-base fork upstream/main) fork" || true
+              echo "::error::Rebase conflict onto $TAG -- resolve locally (see fork/README.md section 4)"
               exit 1
             fi
             git checkout fork
