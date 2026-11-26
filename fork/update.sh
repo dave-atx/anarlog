@@ -2,9 +2,12 @@
 set -euo pipefail
 
 git fetch upstream --tags --force
-NEW_TAG=$(git tag --list 'desktop_v*' --sort=-v:refname | head -1)
+# Newest *published* release, not newest tag: upstream sometimes tags without releasing.
+TAGS=$(gh api 'repos/fastrepl/anarlog/releases?per_page=100' \
+  --jq '.[] | select((.draft or .prerelease) | not) | .tag_name | select(startswith("desktop_v"))')
+NEW_TAG=$(sort -V <<<"$TAGS" | tail -n1)
 if [[ -z "$NEW_TAG" ]]; then
-  echo "No desktop_v* tag found" >&2
+  echo "No published desktop_v* release found" >&2
   exit 1
 fi
 OLD_BASE=$(git merge-base fork upstream/main 2>/dev/null || git merge-base HEAD upstream/main)

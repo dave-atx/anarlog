@@ -20,7 +20,7 @@
 #   alert. The hourly poll retries (and re-fails) until it is resolved locally.
 # - The cron polls hourly at an off-peak minute; GitHub delays scheduled runs by
 #   hours at the top of the hour, and a daily poll can miss a release by a day.
-#   `prepare` resolves the upstream tag over the network and checks for our
+#   `prepare` resolves the latest upstream release via the API and checks for our
 #   release BEFORE any checkout, so a poll with nothing new is a few seconds on
 #   ubuntu-slim. Everything else in `prepare` is gated on that check.
 # - `prepare` runs on ubuntu-slim (1 vCPU container, hard 15 min job limit). A
@@ -83,17 +83,21 @@ jobs:
       cli-fingerprint: ${{ steps.cli-fingerprint.outputs.fingerprint }}
       cli-notes-since: ${{ steps.cli-notes.outputs.cli-notes-since }}
     steps:
-      # No checkout yet: ask upstream for its newest desktop_v* tag directly and
-      # see whether we already released it. Most hourly polls end here.
-      - name: Resolve latest upstream tag
+      # No checkout yet: ask upstream for its newest published desktop release
+      # and see whether we already released it. Most hourly polls end here.
+      # Use published releases, not tags: upstream has pushed desktop_v* tags
+      # it never released (desktop_v2.0.0 had no release; 2.0.2 shipped instead).
+      - name: Resolve latest upstream release
         id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Capture first, trim second: `head` closing the pipe early would
-          # SIGPIPE git under pipefail.
-          REFS=$(git ls-remote --tags --refs --sort=-v:refname https://github.com/fastrepl/anarlog.git 'desktop_v*')
-          TAG=$(sed -n '1s|.*refs/tags/||p' <<<"$REFS")
+          # Capture first, trim second: `tail` would otherwise SIGPIPE under pipefail.
+          TAGS=$(gh api 'repos/fastrepl/anarlog/releases?per_page=100' \
+            --jq '.[] | select((.draft or .prerelease) | not) | .tag_name | select(startswith("desktop_v"))')
+          TAG=$(sort -V <<<"$TAGS" | tail -n1)
           if [[ -z "$TAG" ]]; then
-            echo "::error::No desktop_v* tag found"
+            echo "::error::No published desktop_v* release found"
             exit 1
           fi
           VERSION=${TAG#desktop_v}

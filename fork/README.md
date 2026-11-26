@@ -82,11 +82,12 @@ origin    https://github.com/dave-atx/anarlog.git   (this fork)
 upstream  https://github.com/fastrepl/anarlog.git
 ```
 
-- `fork` is based on a **release tag** (`desktop_v*`), not `main` HEAD, so builds come from the exact commit upstream released. Every `desktop_v*` tag is an ancestor of `upstream/main`, so the base is recoverable without stored state:
+- `fork` is based on a **release tag** (`desktop_v*`) that has a published, non-draft, non-prerelease GitHub release, not `main` HEAD, so builds come from the exact commit upstream released. Every `desktop_v*` tag is an ancestor of `upstream/main`, so the base is recoverable without stored state:
 
   ```sh
   git fetch upstream --tags --force
-  NEW_TAG=$(git tag --list 'desktop_v*' --sort=-v:refname | head -1)
+  NEW_TAG=$(gh api 'repos/fastrepl/anarlog/releases?per_page=100' \
+    --jq '.[] | select((.draft or .prerelease) | not) | .tag_name | select(startswith("desktop_v"))' | sort -V | tail -n1)
   OLD_BASE=$(git merge-base fork upstream/main)
   git rebase --onto "$NEW_TAG" "$OLD_BASE" fork
   ```
@@ -220,7 +221,7 @@ Moving the rebase off macOS into `prepare` (ubuntu-slim) saves macOS runner minu
 
 Steps 1–2 run **before any checkout**, so an hourly poll with nothing new costs a few seconds. Steps 3 onward are all gated on `skip == 'false'`.
 
-1. Resolve the newest upstream `desktop_v*` tag over the network with `git ls-remote --tags --refs --sort=-v:refname https://github.com/fastrepl/anarlog.git 'desktop_v*'` (captured into a variable, then trimmed with `sed`, so `head` can't SIGPIPE git under `pipefail`). Derive `VERSION=${TAG#desktop_v}`. Version is passed **explicitly** to `scripts/version.sh` downstream — `fork` HEAD sits past the tag, so tag-describe would not yield the bare version.
+1. Resolve the newest upstream `desktop_v*` **published release** (not tag) with `gh api repos/fastrepl/anarlog/releases`, dropping drafts and prereleases, then `sort -V | tail -n1` on the captured list. Tags alone aren't enough: upstream pushed `desktop_v2.0.0` but never published a release for it and shipped 2.0.2 instead, so `fork_v2.0.0` exists although upstream never released 2.0.0. Derive `VERSION=${TAG#desktop_v}`. Version is passed **explicitly** to `scripts/version.sh` downstream — `fork` HEAD sits past the tag, so tag-describe would not yield the bare version.
 2. Early-exit (`skip=true` output) if `gh release view fork_v$VERSION` already exists.
 3. Checkout `fetch-depth: 0` + `fetch-tags: true` + `lfs: true`, authenticated with `secrets.FORK_PUSH_TOKEN` (this job is the one that pushes).
 4. Add `upstream` remote, `git fetch upstream --tags --force`, set `user.name`/`user.email`.
